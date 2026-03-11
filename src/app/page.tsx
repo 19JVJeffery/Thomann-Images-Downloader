@@ -21,6 +21,8 @@ interface ImageState extends ProductImage {
 // Matches any thomann.* hostname (e.g. thomann.de, thomann.co.uk, www.thomann.fr)
 const THOMANN_DOMAIN_PATTERN = /^(?:[a-z0-9-]+\.)?thomann\.[a-z]{2,}(?:\.[a-z]{2,})?$/i;
 
+const CORS_PROXY = "https://api.allorigins.win/raw?url=";
+
 function toOriginalUrl(url: string): string {
   return url
     .replace(/\/thumb\/[^/]+\//, "/thumb/orig/")
@@ -53,7 +55,7 @@ function normalizeUrl(url: string, base: string): string {
 }
 
 async function scrapeImages(productUrl: string): Promise<ProductImage[]> {
-  const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(productUrl)}`;
+  const proxyUrl = `${CORS_PROXY}${encodeURIComponent(productUrl)}`;
   const response = await fetch(proxyUrl, {
     signal: AbortSignal.timeout(15000),
   });
@@ -145,7 +147,7 @@ async function downloadAsZip(imgs: ImageState[]): Promise<void> {
 
   for (const img of imgs) {
     try {
-      const response = await fetch(img.url);
+      const response = await fetch(`${CORS_PROXY}${encodeURIComponent(img.url)}`);
       if (!response.ok) continue;
       const buffer = await response.arrayBuffer();
 
@@ -261,7 +263,7 @@ export default function Home() {
 
   const downloadSingle = async (img: ImageState) => {
     try {
-      const response = await fetch(img.url);
+      const response = await fetch(`${CORS_PROXY}${encodeURIComponent(img.url)}`);
       if (!response.ok) throw new Error("Download failed");
       const blob = await response.blob();
       const objectUrl = URL.createObjectURL(blob);
