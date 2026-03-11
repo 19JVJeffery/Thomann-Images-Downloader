@@ -2,13 +2,181 @@
 
 import { useState, useCallback } from "react";
 import Image from "next/image";
-import { ProductImage } from "./api/scrape/route";
+import JSZip from "jszip";
+
+export interface ProductImage {
+  url: string;
+  thumbnail: string;
+  filename: string;
+}
 
 interface ImageState extends ProductImage {
   selected: boolean;
   loading: boolean;
   error: boolean;
 }
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+function toOriginalUrl(url: string): string {
+  return url
+    .replace(/\/thumb\/[^/]+\//, "/thumb/orig/")
+    .replace(/\.webp(\?.*)?$/, ".jpg")
+    .split("?")[0];
+}
+
+function extractFilename(url: string): string {
+  const parts = url.split("/");
+  const last = parts[parts.length - 1];
+  return last.replace(/\?.*$/, "") || "image.jpg";
+}
+
+function isThomannCdnUrl(url: string): boolean {
+  return (
+    url.includes("thumbs.static-thomann.de") ||
+    url.includes("images.static-thomann.de")
+  );
+}
+
+function normalizeUrl(url: string, base: string): string {
+  if (!url) return "";
+  if (url.startsWith("http://") || url.startsWith("https://")) return url;
+  if (url.startsWith("//")) return "https:" + url;
+  if (url.startsWith("/")) {
+    const baseUrl = new URL(base);
+    return baseUrl.origin + url;
+  }
+  return url;
+}
+
+async function scrapeImages(productUrl: string): Promise<ProductImage[]> {
+  const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(productUrl)}`;
+  const response = await fetch(proxyUrl, {
+    signal: AbortSignal.timeout(15000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch page: HTTP ${response.status}`);
+  }
+
+  const html = await response.text();
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, "text/html");
+
+  const seen = new Set<string>();
+  const images: ProductImage[] = [];
+
+  function addImage(rawUrl: string) {
+    const normalized = normalizeUrl(rawUrl, productUrl);
+    if (!normalized || !isThomannCdnUrl(normalized)) return;
+    const orig = toOriginalUrl(normalized);
+    if (seen.has(orig)) return;
+    seen.add(orig);
+    const thumb = orig
+      .replace("/thumb/orig/", "/thumb/pad630x630/")
+      .replace(/\.jpg(\?.*)?$/, ".webp");
+    images.push({ url: orig, thumbnail: thumb, filename: extractFilename(orig) });
+  }
+
+  // 1. img tags
+  doc.querySelectorAll("img[data-zoom-image], img[data-src], img[src]").forEach((el) => {
+    const src =
+      el.getAttribute("data-zoom-image") ||
+      el.getAttribute("data-src") ||
+      el.getAttribute("src") ||
+      "";
+    addImage(src);
+  });
+
+  // 2. Open Graph images
+  doc
+    .querySelectorAll('meta[property="og:image"], meta[name="og:image"]')
+    .forEach((el) => addImage(el.getAttribute("content") || ""));
+
+  // 3. srcset attributes
+  doc.querySelectorAll("[srcset], [data-srcset]").forEach((el) => {
+    const srcset = el.getAttribute("srcset") || el.getAttribute("data-srcset") || "";
+    srcset.split(",").forEach((part) => {
+      const urlPart = part.trim().split(/\s+/)[0];
+      if (urlPart) addImage(urlPart);
+    });
+  });
+
+  // 4. anchor links to CDN images
+  doc.querySelectorAll("a[href]").forEach((el) => {
+    const href = el.getAttribute("href") || "";
+    if (isThomannCdnUrl(href)) addImage(href);
+  });
+
+  // 5. inline scripts (JSON data)
+  doc.querySelectorAll("script").forEach((el) => {
+    const content = el.textContent || "";
+    const cdnMatches = content.match(
+      /https?:\/\/thumbs\.static-thomann\.de\/thumb\/[^"'\s,)]+/g
+    );
+    if (cdnMatches) cdnMatches.forEach((match) => addImage(match));
+  });
+
+  // 6. JSON-LD structured data
+  doc.querySelectorAll('script[type="application/ld+json"]').forEach((el) => {
+    try {
+      const json = JSON.parse(el.textContent || "{}");
+      const imgUrls: string[] = [];
+      if (json.image) {
+        if (Array.isArray(json.image)) imgUrls.push(...json.image);
+        else imgUrls.push(json.image);
+      }
+      if (json.offers?.image) imgUrls.push(json.offers.image);
+      imgUrls.forEach((u) => typeof u === "string" && addImage(u));
+    } catch {
+      // ignore malformed JSON
+    }
+  });
+
+  return images;
+}
+
+async function downloadAsZip(imgs: ImageState[]): Promise<void> {
+  const zip = new JSZip();
+  const usedFilenames = new Set<string>();
+
+  for (const img of imgs) {
+    try {
+      const response = await fetch(img.url);
+      if (!response.ok) continue;
+      const buffer = await response.arrayBuffer();
+
+      let filename = img.filename || "image.jpg";
+      if (usedFilenames.has(filename)) {
+        const ext = filename.includes(".")
+          ? "." + filename.split(".").pop()
+          : "";
+        const base = ext ? filename.slice(0, -ext.length) : filename;
+        let counter = 1;
+        while (usedFilenames.has(`${base}_${counter}${ext}`)) counter++;
+        filename = `${base}_${counter}${ext}`;
+      }
+      usedFilenames.add(filename);
+      zip.file(filename, buffer);
+    } catch {
+      // skip failed downloads, continue with others
+    }
+  }
+
+  if (Object.keys(zip.files).length === 0) {
+    throw new Error("Failed to download any images");
+  }
+
+  const blob = await zip.generateAsync({ type: "blob" });
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = "thomann-images.zip";
+  a.click();
+  URL.revokeObjectURL(objectUrl);
+}
+
+// ── component ─────────────────────────────────────────────────────────────────
 
 export default function Home() {
   const [url, setUrl] = useState("");
@@ -25,35 +193,52 @@ export default function Home() {
 
   const handleFetch = useCallback(async () => {
     if (!url.trim()) return;
+
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(url.trim());
+    } catch {
+      setStatus({ type: "error", message: "Invalid URL" });
+      return;
+    }
+
+    if (!parsedUrl.hostname.includes("thomann.de")) {
+      setStatus({
+        type: "error",
+        message: "URL must be a Thomann product page (thomann.de)",
+      });
+      return;
+    }
+
     setStatus({ type: "loading", message: "Fetching product images…" });
     setImages([]);
 
     try {
-      const res = await fetch("/api/scrape", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: url.trim() }),
-      });
-      const data = await res.json();
+      const imgs = await scrapeImages(url.trim());
 
-      if (!res.ok) {
-        setStatus({ type: "error", message: data.error || "Unknown error" });
+      if (imgs.length === 0) {
+        setStatus({
+          type: "error",
+          message:
+            "No product images found on this page. Make sure you are using a valid Thomann product URL.",
+        });
         return;
       }
 
-      const imageStates: ImageState[] = (data.images as ProductImage[]).map(
-        (img) => ({ ...img, selected: true, loading: true, error: false })
-      );
+      const imageStates: ImageState[] = imgs.map((img) => ({
+        ...img,
+        selected: true,
+        loading: true,
+        error: false,
+      }));
       setImages(imageStates);
       setStatus({
         type: "success",
         message: `Found ${imageStates.length} image${imageStates.length !== 1 ? "s" : ""}`,
       });
-    } catch {
-      setStatus({
-        type: "error",
-        message: "Network error – could not reach the server.",
-      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setStatus({ type: "error", message });
     }
   }, [url]);
 
@@ -95,29 +280,10 @@ export default function Home() {
 
     setDownloading(true);
     try {
-      const res = await fetch("/api/download", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          images: selectedImages.map(({ url, filename }) => ({ url, filename })),
-        }),
-      });
-
-      if (!res.ok) {
-        const data = await res.json();
-        alert(data.error || "Download failed");
-        return;
-      }
-
-      const blob = await res.blob();
-      const objectUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = objectUrl;
-      a.download = "thomann-images.zip";
-      a.click();
-      URL.revokeObjectURL(objectUrl);
-    } catch {
-      alert("Failed to download images");
+      await downloadAsZip(selectedImages);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Download failed";
+      alert(message);
     } finally {
       setDownloading(false);
     }
