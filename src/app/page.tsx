@@ -18,6 +18,9 @@ interface ImageState extends ProductImage {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+// Matches any thomann.* hostname (e.g. thomann.de, thomann.co.uk, www.thomann.fr)
+const THOMANN_DOMAIN_PATTERN = /^(?:[a-z0-9-]+\.)?thomann\.[a-z]{2,}(?:\.[a-z]{2,})?$/i;
+
 function toOriginalUrl(url: string): string {
   return url
     .replace(/\/thumb\/[^/]+\//, "/thumb/orig/")
@@ -203,15 +206,11 @@ export default function Home() {
     }
 
     const host = parsedUrl.hostname;
-    const isThomann =
-      host === "thomann.de" ||
-      host.endsWith(".thomann.de") ||
-      host === "thomann.com" ||
-      host.endsWith(".thomann.com");
+    const isThomann = THOMANN_DOMAIN_PATTERN.test(host);
     if (!isThomann) {
       setStatus({
         type: "error",
-        message: "URL must be a Thomann product page (thomann.de or thomann.com)",
+        message: "URL must be a Thomann product page (e.g. thomann.de, thomann.co.uk)",
       });
       return;
     }
