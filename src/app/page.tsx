@@ -202,10 +202,16 @@ export default function Home() {
       return;
     }
 
-    if (!parsedUrl.hostname.includes("thomann.de")) {
+    const host = parsedUrl.hostname;
+    const isThomann =
+      host === "thomann.de" ||
+      host.endsWith(".thomann.de") ||
+      host === "thomann.com" ||
+      host.endsWith(".thomann.com");
+    if (!isThomann) {
       setStatus({
         type: "error",
-        message: "URL must be a Thomann product page (thomann.de)",
+        message: "URL must be a Thomann product page (thomann.de or thomann.com)",
       });
       return;
     }
